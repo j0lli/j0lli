@@ -47,7 +47,7 @@ jobs:
 
       - name: Checkout private scanner
         if: steps.window.outputs.open == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: j0lli/nexora
           ref: main
@@ -68,6 +68,66 @@ jobs:
         if: steps.window.outputs.open == 'true'
         continue-on-error: true
         run: python3 nexora/scanner/quant_scanner.py
+
+      - name: Deliver quality-gated Head handoff
+        if: always() && steps.window.outputs.open == 'true' && hashFiles('nexora/scanner/out/quant-data/quant_desk_handoff.json') != ''
+        env:
+          WEBHOOK_URL: ${{ secrets.QUANT_HEAD_WEBHOOK_URL }}
+          WEBHOOK_KEY: ${{ secrets.QUANT_HEAD_WEBHOOK_KEY }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          url = os.environ.get("WEBHOOK_URL", "").strip()
+          key = os.environ.get("WEBHOOK_KEY", "")
+          if not url or not key:
+              print("Head webhook disabled: URL or key is not configured.")
+              raise SystemExit(0)
+          parsed = urllib.parse.urlparse(url)
+          if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+              print("Head webhook configuration rejected: HTTPS URL required.")
+              raise SystemExit(1)
+          path = Path(os.environ["QUANT_DATA_DIR"]) / "quant_desk_handoff.json"
+          handoff = json.loads(path.read_text(encoding="utf-8"))
+          if handoff.get("desk_state") not in {"candidate_review", "watch_only"}:
+              print("Head handoff skipped: scanner quality gate is holding the data.")
+              raise SystemExit(0)
+          body = json.dumps(handoff, separators=(",", ":")).encode("utf-8")
+          request = urllib.request.Request(
+              url, data=body, method="POST",
+              headers={"Content-Type": "application/json", "Accept": "application/json",
+                       "Authorization": f"Bearer {key}",
+                       "User-Agent": "nexora-github-runner/1.0"},
+          )
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          opener = urllib.request.build_opener(NoRedirect)
+          for attempt in range(2):
+              try:
+                  with opener.open(request, timeout=10) as response:
+                      if 200 <= response.status < 300:
+                          print("Head handoff delivered.")
+                          raise SystemExit(0)
+                      raise RuntimeError(f"HTTP status {response.status}")
+              except urllib.error.HTTPError as error:
+                  if error.code not in {429, 500, 502, 503, 504} or attempt:
+                      print(f"Head handoff failed: HTTP {error.code}.")
+                      raise SystemExit(1)
+                  time.sleep(1)
+              except Exception as error:
+                  if attempt:
+                      print(f"Head handoff failed: {type(error).__name__}.")
+                      raise SystemExit(1)
+                  time.sleep(1)
+          PY
 
       - name: Publish scan state to private repository
         id: publish
