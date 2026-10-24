@@ -1,0 +1,108 @@
+name: Nexora private-source scan
+
+on:
+  schedule:
+    # UTC union of the Europe/Rome weekday window; the job checks the local window.
+    - cron: "*/10 6-22 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexora-private-source-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    # Enable only after NEXORA_REPO_TOKEN is configured in this public repo.
+    if: ${{ vars.NEXORA_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      QUANT_DATA_DIR: ${{ github.workspace }}/nexora/scanner/out/quant-data
+      QUANT_CACHE_DIR: ${{ github.workspace }}/nexora/scanner/out/quant-cache
+      QUANT_STATE_BRANCH: quant-scanner-data
+      QUANT_SCAN_DEADLINE_SEC: "240"
+      QUANT_WORKERS: "10"
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+      COINGECKO_DEMO_API_KEY: ${{ secrets.COINGECKO_DEMO_API_KEY }}
+      DESK_NEWS_RSS_URLS: ${{ vars.DESK_NEWS_RSS_URLS }}
+      QUANT_HEAD_WEBHOOK_URL: ${{ secrets.QUANT_HEAD_WEBHOOK_URL }}
+      QUANT_HEAD_WEBHOOK_KEY: ${{ secrets.QUANT_HEAD_WEBHOOK_KEY }}
+    steps:
+      - name: Check Europe/Rome desk window
+        id: window
+        run: |
+          python3 - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          now = datetime.now(ZoneInfo("Europe/Rome"))
+          allowed = now.weekday() < 5 and 8 <= now.hour < 23
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"open={str(allowed).lower()}\\n")
+          print(f"Europe/Rome time: {now:%Y-%m-%d %H:%M:%S %Z}; scan window open={allowed}")
+          PY
+
+      - name: Checkout private scanner
+        if: steps.window.outputs.open == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: j0lli/nexora
+          ref: main
+          token: ${{ secrets.NEXORA_REPO_TOKEN }}
+          path: nexora
+          persist-credentials: true
+
+      - name: Install Python dependency
+        if: steps.window.outputs.open == 'true'
+        run: python3 -m pip install --disable-pip-version-check -r nexora/scanner/requirements.txt
+
+      - name: Restore private scanner state
+        if: steps.window.outputs.open == 'true'
+        run: bash nexora/scanner/restore_quant_state.sh
+
+      - name: Run one read-only scan
+        id: quant_scan
+        if: steps.window.outputs.open == 'true'
+        continue-on-error: true
+        run: python3 nexora/scanner/quant_scanner.py
+
+      - name: Publish scan state to private repository
+        id: publish
+        if: always() && steps.window.outputs.open == 'true' && hashFiles('nexora/scanner/out/quant-data/quant_heartbeat.json') != ''
+        run: bash nexora/scanner/publish_quant_state.sh
+
+      - name: Summarize scan
+        if: always() && steps.window.outputs.open == 'true'
+        env:
+          SCAN_OUTCOME: ${{ steps.quant_scan.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          path = Path(os.environ["QUANT_DATA_DIR"]) / "quant_heartbeat.json"
+          if path.exists():
+              hb = json.loads(path.read_text(encoding="utf-8"))
+              lines = [
+                  "## Nexora market scan", "",
+                  f"- Status: **{hb.get('status', 'unknown')}**",
+                  f"- Desk state: **{hb.get('desk_state', 'unknown')}**",
+                  f"- Market coverage: **{hb.get('coverage_pct', 'unknown')}%**",
+                  f"- Runtime: **{hb.get('runtime_seconds', 'unknown')} s**",
+                  f"- Scan: `{hb.get('timestamp_utc', 'unknown')}`",
+                  "- Source and output state remain in private repository `j0lli/nexora`.",
+              ]
+          else:
+              lines = ["## Nexora market scan", "", "- No heartbeat was produced."]
+          if os.environ.get("SCAN_OUTCOME") != "success":
+              lines.append("- Scanner process returned an error; inspect this run's logs.")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("\\n".join(lines) + "\\n")
+          PY
+
+      - name: Fail if scan or state publication failed
+        if: always() && steps.window.outputs.open == 'true' && (steps.quant_scan.outcome == 'failure' || steps.publish.outcome == 'failure')
+        run: exit 1
