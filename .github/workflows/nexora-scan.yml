@@ -2,8 +2,8 @@ name: Nexora private-source scan
 
 on:
   schedule:
-    # UTC union of the Europe/Rome weekday window; the job checks the local window.
-    - cron: "*/10 6-22 * * 1-5"
+    # UTC union of the Rome window. Local-time gate handles CET/CEST.
+    - cron: "*/10 6-21 * * 1-5"
   workflow_dispatch:
 
 permissions:
@@ -41,7 +41,7 @@ jobs:
           now = datetime.now(ZoneInfo("Europe/Rome"))
           allowed = now.weekday() < 5 and 8 <= now.hour < 23
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"open={str(allowed).lower()}\\n")
+              output.write(f"open={str(allowed).lower()}\n")
           print(f"Europe/Rome time: {now:%Y-%m-%d %H:%M:%S %Z}; scan window open={allowed}")
           PY
 
@@ -100,7 +100,7 @@ jobs:
           if os.environ.get("SCAN_OUTCOME") != "success":
               lines.append("- Scanner process returned an error; inspect this run's logs.")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write("\\n".join(lines) + "\\n")
+              summary.write("\n".join(lines) + "\n")
           PY
 
       - name: Fail if scan or state publication failed
