@@ -103,7 +103,8 @@ jobs:
               previous = json.loads(previous_path.read_text(encoding="utf-8"))
           except (OSError, json.JSONDecodeError):
               previous = {}
-          delivery = previous.get("delivery", {}) if isinstance(previous, dict) else {}\nprevious_delivery = delivery.get("head_webhook", {}) if isinstance(delivery, dict) else {}
+          delivery = previous.get("delivery", {}) if isinstance(previous, dict) else {}
+          previous_delivery = delivery.get("head_webhook", {}) if isinstance(delivery, dict) else {}
           last_sent_fp = previous_delivery.get("last_sent_fingerprint")
           last_sent_at = previous_delivery.get("last_sent_at_unix")
           now = int(time.time())
