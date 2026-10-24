@@ -63,6 +63,14 @@ jobs:
         if: steps.window.outputs.open == 'true'
         run: bash nexora/scanner/restore_quant_state.sh
 
+      - name: Preserve previous delivery state
+        if: steps.window.outputs.open == 'true'
+        run: |
+          source_file="nexora/scanner/out/quant-data/quant_scan_latest.json"
+          if [[ -f "$source_file" ]]; then
+            cp "$source_file" "$RUNNER_TEMP/nexora_previous_scan.json"
+          fi
+
       - name: Run one read-only scan
         id: quant_scan
         if: steps.window.outputs.open == 'true'
@@ -70,12 +78,13 @@ jobs:
         run: python3 nexora/scanner/quant_scanner.py
 
       - name: Deliver quality-gated Head handoff
-        if: always() && steps.window.outputs.open == 'true' && hashFiles('nexora/scanner/out/quant-data/quant_desk_handoff.json') != ''
+        if: always() && steps.window.outputs.open == 'true' && steps.quant_scan.outcome == 'success' && hashFiles('nexora/scanner/out/quant-data/quant_desk_handoff.json') != ''
         env:
           WEBHOOK_URL: ${{ secrets.QUANT_HEAD_WEBHOOK_URL }}
           WEBHOOK_KEY: ${{ secrets.QUANT_HEAD_WEBHOOK_KEY }}
         run: |
           python3 - <<'PY'
+          import hashlib
           import json
           import os
           import sys
@@ -85,20 +94,87 @@ jobs:
           import urllib.request
           from pathlib import Path
 
+          data_dir = Path(os.environ["QUANT_DATA_DIR"])
+          handoff_path = data_dir / "quant_desk_handoff.json"
+          latest_path = data_dir / "quant_scan_latest.json"
+          latest = json.loads(latest_path.read_text(encoding="utf-8"))
+          previous_path = Path(os.environ["RUNNER_TEMP"]) / "nexora_previous_scan.json"
+          try:
+              previous = json.loads(previous_path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              previous = {}
+          previous_delivery = previous.get("delivery", {}) if isinstance(previous, dict) else {}
+          last_sent_fp = previous_delivery.get("last_sent_fingerprint")
+          last_sent_at = previous_delivery.get("last_sent_at_unix")
+          now = int(time.time())
+
+          def persist(status, fingerprint=None, sent_at=None):
+              state = {"status": status}
+              if fingerprint:
+                  state["last_sent_fingerprint"] = fingerprint
+              if sent_at:
+                  state["last_sent_at_unix"] = sent_at
+              latest["delivery"] = {"head_webhook": state}
+              latest_path.write_text(json.dumps(latest, separators=(",", ":")) + "\\n", encoding="utf-8")
+
           url = os.environ.get("WEBHOOK_URL", "").strip()
           key = os.environ.get("WEBHOOK_KEY", "")
           if not url or not key:
+              persist("disabled", last_sent_fp, last_sent_at)
               print("Head webhook disabled: URL or key is not configured.")
               raise SystemExit(0)
+
           parsed = urllib.parse.urlparse(url)
           if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+              persist("invalid_configuration", last_sent_fp, last_sent_at)
               print("Head webhook configuration rejected: HTTPS URL required.")
               raise SystemExit(1)
-          path = Path(os.environ["QUANT_DATA_DIR"]) / "quant_desk_handoff.json"
-          handoff = json.loads(path.read_text(encoding="utf-8"))
+
+          handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
           if handoff.get("desk_state") not in {"candidate_review", "watch_only"}:
+              persist("skipped_quality_gate", last_sent_fp, last_sent_at)
               print("Head handoff skipped: scanner quality gate is holding the data.")
               raise SystemExit(0)
+
+          def signature_rows(rows, direction):
+              result = []
+              for row in rows if isinstance(rows, list) else []:
+                  if not isinstance(row, dict):
+                      continue
+                  score = row.get("research_score")
+                  score_band = int(float(score) // 5) if isinstance(score, (int, float)) else None
+                  result.append({
+                      "direction": direction,
+                      "symbol": row.get("symbol"),
+                      "contract": row.get("contract"),
+                      "setup": row.get("primary_setup"),
+                      "score_band": score_band,
+                  })
+              return result
+
+          qualified = handoff.get("qualified_by_local_screen", {})
+          watch = handoff.get("watch_only", {})
+          signature = {
+              "desk_state": handoff.get("desk_state"),
+              "long": signature_rows(qualified.get("long"), "long") + signature_rows(watch.get("long"), "long"),
+              "short": signature_rows(qualified.get("short"), "short") + signature_rows(watch.get("short"), "short"),
+          }
+          if not signature["long"] and not signature["short"]:
+              persist("no_candidates", last_sent_fp, last_sent_at)
+              print("Head handoff skipped: no ranked long or short candidates.")
+              raise SystemExit(0)
+          fingerprint = hashlib.sha256(
+              json.dumps(signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
+          ).hexdigest()
+          try:
+              last_sent_at = int(last_sent_at) if last_sent_at is not None else None
+          except (TypeError, ValueError):
+              last_sent_at = None
+          if fingerprint == last_sent_fp and last_sent_at and now - last_sent_at < 1800:
+              persist("deduplicated", last_sent_fp, last_sent_at)
+              print("Head handoff deduplicated: unchanged candidates were sent recently.")
+              raise SystemExit(0)
+
           body = json.dumps(handoff, separators=(",", ":")).encode("utf-8")
           request = urllib.request.Request(
               url, data=body, method="POST",
@@ -114,16 +190,19 @@ jobs:
               try:
                   with opener.open(request, timeout=10) as response:
                       if 200 <= response.status < 300:
+                          persist("sent", fingerprint, now)
                           print("Head handoff delivered.")
                           raise SystemExit(0)
                       raise RuntimeError(f"HTTP status {response.status}")
               except urllib.error.HTTPError as error:
                   if error.code not in {429, 500, 502, 503, 504} or attempt:
+                      persist("failed_http", last_sent_fp, last_sent_at)
                       print(f"Head handoff failed: HTTP {error.code}.")
                       raise SystemExit(1)
                   time.sleep(1)
               except Exception as error:
                   if attempt:
+                      persist("failed_" + type(error).__name__, last_sent_fp, last_sent_at)
                       print(f"Head handoff failed: {type(error).__name__}.")
                       raise SystemExit(1)
                   time.sleep(1)
