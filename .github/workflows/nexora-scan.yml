@@ -75,8 +75,6 @@ jobs:
 
       - name: Mark scan start
         if: steps.window.outputs.open == 'true'
-        env:
-          QUANT_DATA_DIR: ${{ env.QUANT_DATA_DIR }}
         run: |
           python3 - <<'PY'
           import os
@@ -97,8 +95,6 @@ jobs:
       - name: Confirm this run produced a fresh heartbeat
         id: heartbeat
         if: always() && steps.window.outputs.open == 'true'
-        env:
-          QUANT_DATA_DIR: ${{ env.QUANT_DATA_DIR }}
         run: |
           python3 - <<'PY'
           import json
@@ -122,7 +118,7 @@ jobs:
               pass
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"fresh={str(fresh).lower()}\\n")
+              output.write("fresh=" + str(fresh).lower() + chr(10))
           print(f"Fresh scan heartbeat produced: {fresh}")
           PY
 
