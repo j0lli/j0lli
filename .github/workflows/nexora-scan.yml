@@ -73,28 +73,72 @@ jobs:
         if: steps.window.outputs.open == 'true'
         run: bash nexora/scanner/restore_quant_state.sh
 
+      - name: Mark scan start
+        if: steps.window.outputs.open == 'true'
+        run: |
+          python3 - <<'PY'
+          import os
+          import time
+          from pathlib import Path
+
+          data_dir = Path(os.environ["QUANT_DATA_DIR"])
+          data_dir.mkdir(parents=True, exist_ok=True)
+          (data_dir / ".scan_started_at").write_text(str(time.time()), encoding="utf-8")
+          PY
+
       - name: Run one read-only market scan
         id: quant_scan
         if: steps.window.outputs.open == 'true'
         continue-on-error: true
         run: python nexora/scanner/quant_scanner.py
 
+      - name: Confirm this run produced a fresh heartbeat
+        id: heartbeat
+        if: always() && steps.window.outputs.open == 'true'
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          from datetime import datetime
+          from pathlib import Path
+
+          data_dir = Path(os.environ["QUANT_DATA_DIR"])
+          start_path = data_dir / ".scan_started_at"
+          heartbeat_path = data_dir / "quant_heartbeat.json"
+          fresh = False
+          try:
+              started = float(start_path.read_text(encoding="utf-8"))
+              heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+              timestamp = datetime.fromisoformat(
+                  heartbeat["timestamp_utc"].replace("Z", "+00:00")
+              ).timestamp()
+              fresh = started - 5 <= timestamp <= time.time() + 60
+          except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+              pass
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("fresh=" + str(fresh).lower() + chr(10))
+          print(f"Fresh scan heartbeat produced: {fresh}")
+          PY
+
       - name: Publish scan state to private repository
         id: publish
-        if: always() && steps.window.outputs.open == 'true' && hashFiles('nexora/scanner/out/quant-data/quant_heartbeat.json') != ''
+        if: always() && steps.window.outputs.open == 'true' && steps.heartbeat.outputs.fresh == 'true'
         run: bash nexora/scanner/publish_quant_state.sh
 
       - name: Summarize scan
         if: always() && steps.window.outputs.open == 'true'
         env:
           SCAN_OUTCOME: ${{ steps.quant_scan.outcome }}
+          FRESH_HEARTBEAT: ${{ steps.heartbeat.outputs.fresh }}
         run: |
           python3 - <<'PY'
           import json
           import os
           from pathlib import Path
           path = Path(os.environ["QUANT_DATA_DIR"]) / "quant_heartbeat.json"
-          if path.exists():
+          if path.exists() and os.environ.get("FRESH_HEARTBEAT") == "true":
               hb = json.loads(path.read_text(encoding="utf-8"))
               wakeup = hb.get("analyst_wakeup")
               wakeup = wakeup if isinstance(wakeup, dict) else {}
@@ -109,13 +153,13 @@ jobs:
                   "- Source and output state remain in private repository `j0lli/nexora`.",
               ]
           else:
-              lines = ["## Nexora market scan", "", "- No heartbeat was produced."]
+              lines = ["## Nexora market scan", "", "- No fresh heartbeat was produced for this run."]
           if os.environ.get("SCAN_OUTCOME") != "success":
               lines.append("- Scanner process returned an error; inspect this run's logs.")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
               summary.write("\n".join(lines) + "\n")
           PY
 
-      - name: Fail if scan or state publication failed
-        if: always() && steps.window.outputs.open == 'true' && (steps.quant_scan.outcome == 'failure' || steps.publish.outcome == 'failure')
+      - name: Fail if scan, heartbeat, or state publication failed
+        if: always() && steps.window.outputs.open == 'true' && (steps.quant_scan.outcome == 'failure' || steps.heartbeat.outputs.fresh != 'true' || steps.publish.outcome == 'failure')
         run: exit 1
