@@ -2,8 +2,8 @@ name: Nexora private-source scan
 
 on:
   schedule:
-    # Hourly UTC wake-ups; the Europe/Rome gate includes 08:00 and 23:00.
-    - cron: "0 6-22 * * 1-5"
+    # Ten-minute UTC slots; the Europe/Rome gate handles CET/CEST and the final 23:00 slot.
+    - cron: "*/10 6-22 * * 1-5"
   workflow_dispatch:
 
 permissions:
@@ -41,7 +41,8 @@ jobs:
           from datetime import datetime
           from zoneinfo import ZoneInfo
           now = datetime.now(ZoneInfo("Europe/Rome"))
-          allowed = now.weekday() < 5 and 8 <= now.hour <= 23
+          # Scheduled starts in the 23:00 slot may arrive a few minutes late.
+          allowed = now.weekday() < 5 and (8 <= now.hour < 23 or (now.hour == 23 and now.minute < 10))
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"open={str(allowed).lower()}\n")
           print(f"Europe/Rome time: {now:%Y-%m-%d %H:%M:%S %Z}; scan window open={allowed}")
